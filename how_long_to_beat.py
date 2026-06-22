@@ -25,27 +25,31 @@ PLAY_MODES = [
     ("Multiplayer",          "mp_time"),
 ]
 
-# Time buckets used as Steam category names
-BUCKETS = [
-    (0,   5,   "HLTB: ≤5h"),
-    (5,   15,  "HLTB: 5-15h"),
-    (15,  30,  "HLTB: 15-30h"),
-    (30,  60,  "HLTB: 30-60h"),
-    (60,  float("inf"), "HLTB: 60h+"),
+HLTB_BUCKETS = [
+    (0,          5,          "HLTB: ≤5h"),
+    (5,          15,         "HLTB: 5-15h"),
+    (15,         30,         "HLTB: 15-30h"),
+    (30,         60,         "HLTB: 30-60h"),
+    (60, float("inf"),       "HLTB: 60h+"),
 ]
-NO_DATA_TAG = "HLTB: No data"
-TAG_PREFIX  = "HLTB:"
+HLTB_NO_DATA = "HLTB: No data"
 
+MC_BUCKETS = [
+    (90, "MC: 90+"),
+    (75, "MC: 75-89"),
+    (50, "MC: 50-74"),
+    (0,  "MC: <50"),
+]
+MC_NO_SCORE = "MC: N/A"
+
+TAG_PREFIX = "HLTB:"
 CACHE_FILE = Path("hltb_cache.json")
-
-# SteamID64 base constant
 _STEAM64_BASE = 76561197960265728
 
 
-# ── helpers ──────────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
 
 def ask(prompt: str, lo: int, hi: int) -> int:
-    """Prompt until user enters an int in [lo, hi]."""
     while True:
         try:
             v = int(input(prompt))
@@ -57,7 +61,6 @@ def ask(prompt: str, lo: int, hi: int) -> int:
 
 
 def _pos(val) -> float | None:
-    """Return float if val is a positive number, else None."""
     try:
         v = float(val)
         return v if v > 0 else None
@@ -65,13 +68,27 @@ def _pos(val) -> float | None:
         return None
 
 
-def bucket_label(hours: float | None) -> str:
+def hltb_bucket(hours: float | None) -> str:
     if hours is None:
-        return NO_DATA_TAG
-    for lo, hi, label in BUCKETS:
+        return HLTB_NO_DATA
+    for lo, hi, label in HLTB_BUCKETS:
         if lo <= hours < hi:
             return label
     return "HLTB: 60h+"
+
+
+def mc_bucket(score: int | None) -> str:
+    if score is None:
+        return MC_NO_SCORE
+    for threshold, label in MC_BUCKETS:
+        if score >= threshold:
+            return label
+    return "MC: <50"
+
+
+def steam_tag(hours: float | None, mc_score: int | None, use_mc: bool) -> str:
+    h = hltb_bucket(hours)
+    return f"{h} | {mc_bucket(mc_score)}" if use_mc else h
 
 
 # ── cache ─────────────────────────────────────────────────────────────────────
@@ -148,15 +165,13 @@ def fetch_hltb_data(library: list[dict]) -> list[dict]:
                 "all_styles":    best.all_styles,
                 "coop_time":     best.coop_time,
                 "mp_time":       best.mp_time,
-                "score":         best.review_score,
-                "year":          best.release_world,
                 "cached_on":     str(date.today()),
             }
         save_cache(cache)
         if not_found:
-            console.print(f"[dim]{len(not_found)} games not found on HLTB (cached as missing).[/dim]")
+            console.print(f"[dim]{len(not_found)} games not found on HLTB (cached).[/dim]")
     else:
-        console.print("[dim]All games loaded from cache.[/dim]")
+        console.print("[dim]HLTB data loaded from cache.[/dim]")
 
     results = []
     for game in library:
@@ -174,10 +189,60 @@ def fetch_hltb_data(library: list[dict]) -> list[dict]:
             "all_styles":    _pos(c["all_styles"]),
             "coop_time":     _pos(c["coop_time"]),
             "mp_time":       _pos(c["mp_time"]),
-            "score":         c["score"],
-            "year":          c["year"],
+            "mc_score":      None,  # filled by fetch_metacritic_scores if requested
         })
     return results
+
+
+# ── Metacritic ────────────────────────────────────────────────────────────────
+
+def fetch_metacritic_scores(games: list[dict]) -> None:
+    """Fetch Metacritic scores from Steam Store API; populate game['mc_score'] in-place."""
+    cache = load_cache()
+    cache_key = lambda app_id: f"mc:{app_id}"
+
+    to_fetch = [g for g in games if cache_key(g["appID"]) not in cache]
+    if to_fetch:
+        for game in track(to_fetch, description="Fetching Metacritic scores..."):
+            app_id = game["appID"]
+            url = (
+                f"https://store.steampowered.com/api/appdetails"
+                f"?appids={app_id}&filters=metacritic"
+            )
+            score = None
+            try:
+                raw = json.loads(urllib.request.urlopen(url, timeout=10).read())
+                entry = raw.get(app_id, {})
+                if entry.get("success"):
+                    score = entry.get("data", {}).get("metacritic", {}).get("score")
+            except Exception:
+                pass
+            cache[cache_key(app_id)] = {"score": score, "cached_on": str(date.today())}
+        save_cache(cache)
+    else:
+        console.print("[dim]Metacritic scores loaded from cache.[/dim]")
+
+    for game in games:
+        entry = cache.get(cache_key(game["appID"]), {})
+        game["mc_score"] = entry.get("score")
+
+
+def ask_metacritic_filter(games: list[dict]) -> int | None:
+    """Ask user for Metacritic filter; returns minimum score or None."""
+    console.print("\n[bold]Filter by Metacritic score?[/bold]")
+    console.print("  1. No filter")
+    console.print("  2. Yes — set minimum score")
+    if ask("Choose (1–2): ", 1, 2) == 1:
+        return None
+    fetch_metacritic_scores(games)
+    while True:
+        try:
+            v = int(input("Minimum Metacritic score (0–100): "))
+            if 0 <= v <= 100:
+                return v
+        except ValueError:
+            pass
+        print("  Enter 0–100")
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -194,7 +259,13 @@ def pick_play_mode(games: list[dict]) -> tuple[str, str]:
     return available[idx]
 
 
-def display(games: list[dict], sort_label: str, sort_field: str, reverse: bool) -> None:
+def display(
+    games: list[dict],
+    sort_label: str,
+    sort_field: str,
+    reverse: bool,
+    show_mc: bool,
+) -> None:
     has_data = sorted(
         [g for g in games if g[sort_field] is not None],
         key=lambda x: x[sort_field],
@@ -206,27 +277,34 @@ def display(games: list[dict], sort_label: str, sort_field: str, reverse: bool) 
         return f"{v:.1f}h" if v is not None else "[dim]-[/dim]"
 
     order_label = "longest" if reverse else "shortest"
-    table = Table(
-        title=f"Steam Library — {sort_label} ({order_label} first)",
-        show_lines=False,
-    )
+    title = f"Steam Library — {sort_label} ({order_label} first)"
+    if show_mc:
+        title += " · Metacritic filtered"
+
+    table = Table(title=title, show_lines=False)
     table.add_column("#",        style="dim",   width=4,  justify="right")
     table.add_column("Game",     style="cyan",  min_width=30)
     table.add_column(sort_label, justify="right", style="green")
-    table.add_column("Score",    justify="right", style="yellow")
+    if show_mc:
+        table.add_column("Metacritic", justify="right", style="magenta")
     table.add_column("Year",     justify="right", style="dim")
 
+    def add_row(rank: str, g: dict) -> None:
+        year = str(g["year"]) if g.get("year") else "-"
+        row  = [rank, g["name"], fmt(g[sort_field])]
+        if show_mc:
+            mc = g["mc_score"]
+            row.append(str(mc) if mc is not None else "[dim]-[/dim]")
+        row.append(year)
+        table.add_row(*row)
+
     for rank, g in enumerate(has_data, 1):
-        score = str(g["score"]) if g["score"] else "-"
-        year  = str(g["year"])  if g["year"]  else "-"
-        table.add_row(str(rank), g["name"], fmt(g[sort_field]), score, year)
+        add_row(str(rank), g)
 
     if no_data:
         table.add_section()
         for g in no_data:
-            score = str(g["score"]) if g["score"] else "-"
-            year  = str(g["year"])  if g["year"]  else "-"
-            table.add_row("-", g["name"], "-", score, year)
+            add_row("-", g)
 
     console.print(table)
     console.print(
@@ -254,10 +332,18 @@ def _find_sharedconfig(steam_id64: str) -> Path | None:
     return None
 
 
-def write_steam_categories(games: list[dict], sort_field: str, steam_id64: str) -> None:
-    """Write HLTB time-bucket tags to sharedconfig.vdf so they appear in Steam."""
+def write_steam_categories(
+    games: list[dict],
+    sort_field: str,
+    steam_id64: str,
+    use_mc: bool,
+) -> None:
+    """Write combined HLTB + Metacritic tags to sharedconfig.vdf."""
     console.print("\n[bold]Write categories to Steam?[/bold]")
-    console.print("  Games get tagged by time bucket, e.g. [cyan]HLTB: 5-15h[/cyan].")
+    if use_mc:
+        console.print("  Tags will be like [cyan]HLTB: 5-15h | MC: 90+[/cyan]")
+    else:
+        console.print("  Tags will be like [cyan]HLTB: 5-15h[/cyan]")
     console.print("  [yellow]⚠ Close Steam first — Steam overwrites this file on exit.[/yellow]")
     console.print("  1. Yes — write Steam categories")
     console.print("  2. No  — skip")
@@ -268,13 +354,12 @@ def write_steam_categories(games: list[dict], sort_field: str, steam_id64: str) 
     if config_path is None:
         console.print(
             "[red]sharedconfig.vdf not found.[/red]\n"
-            "[dim]Run Steam at least once and check the profile is yours.[/dim]"
+            "[dim]Run Steam at least once and ensure this is your profile.[/dim]"
         )
         return
 
     console.print(f"[dim]Config: {config_path}[/dim]")
 
-    # Backup before any write
     backup = config_path.with_suffix(".vdf.bak")
     backup.write_bytes(config_path.read_bytes())
     console.print(f"[dim]Backup → {backup}[/dim]")
@@ -282,24 +367,22 @@ def write_steam_categories(games: list[dict], sort_field: str, steam_id64: str) 
     with config_path.open(encoding="utf-8") as f:
         data = vdf.load(f)
 
-    # Navigate to Apps section
     try:
-        apps = (
-            data["UserRoamingConfigStore"]["Software"]["Valve"]["Steam"]["Apps"]
-        )
+        apps = data["UserRoamingConfigStore"]["Software"]["Valve"]["Steam"]["Apps"]
     except KeyError:
         console.print("[red]Unexpected VDF structure — aborting.[/red]")
         return
 
-    tag = {g["appID"]: bucket_label(g[sort_field]) for g in games}
+    for game in games:
+        app_id    = game["appID"]
+        new_label = steam_tag(game[sort_field], game["mc_score"], use_mc)
 
-    for app_id, new_label in tag.items():
         if app_id not in apps:
             apps[app_id] = {}
-        existing_tags: dict = apps[app_id].get("tags", {})
+        existing: dict = apps[app_id].get("tags", {})
 
-        # Keep tags that aren't ours, rebuild with new bucket
-        kept = {k: v for k, v in existing_tags.items() if not str(v).startswith(TAG_PREFIX)}
+        # Keep non-HLTB tags; replace old HLTB tag
+        kept = {k: v for k, v in existing.items() if not str(v).startswith(TAG_PREFIX)}
         next_idx = str(max((int(k) for k in kept), default=-1) + 1)
         kept[next_idx] = new_label
         apps[app_id]["tags"] = kept
@@ -308,7 +391,7 @@ def write_steam_categories(games: list[dict], sort_field: str, steam_id64: str) 
         vdf.dump(data, f, pretty=True)
 
     console.print(
-        f"[green]Done.[/green] Tagged {len(tag)} games. "
+        f"[green]Done.[/green] Tagged {len(games)} games. "
         "[dim]Restart Steam to see categories in the left panel.[/dim]"
     )
 
@@ -331,6 +414,21 @@ def main() -> None:
         console.print("[red]No HLTB matches.[/red]")
         sys.exit(1)
 
+    # Metacritic filter (fetches + caches scores if requested)
+    min_mc = ask_metacritic_filter(games)
+    use_mc = min_mc is not None
+
+    if use_mc:
+        before = len(games)
+        games = [g for g in games if g["mc_score"] is not None and g["mc_score"] >= min_mc]
+        console.print(
+            f"Filtered to [bold]{len(games)}[/bold] games "
+            f"with Metacritic ≥ {min_mc} (dropped {before - len(games)})."
+        )
+        if not games:
+            console.print("[red]No games pass the filter.[/red]")
+            sys.exit(1)
+
     sort_label, sort_field = pick_play_mode(games)
 
     console.print("\n[bold]Order?[/bold]")
@@ -338,8 +436,8 @@ def main() -> None:
     console.print("  2. Longest first")
     order = ask("Choose (1–2): ", 1, 2)
 
-    display(games, sort_label, sort_field, reverse=(order == 2))
-    write_steam_categories(games, sort_field, steam_id64)
+    display(games, sort_label, sort_field, reverse=(order == 2), show_mc=use_mc)
+    write_steam_categories(games, sort_field, steam_id64, use_mc=use_mc)
 
 
 if __name__ == "__main__":
