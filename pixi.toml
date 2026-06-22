@@ -13,6 +13,7 @@ rich = ">=13.0"
 
 [pypi-dependencies]
 howlongtobeatpy = ">=1.0"
+vdf = ">=3.4, <4"
 
 [tasks]
 run = "python how_long_to_beat.py"
